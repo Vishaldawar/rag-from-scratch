@@ -7,3 +7,4 @@ gpt2-fine-tuned
 __pycache__
 chroma_db/
 venv_rag/
+venv_311/
