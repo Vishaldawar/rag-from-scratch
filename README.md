@@ -8,7 +8,7 @@ Built as a learning project to deeply understand how RAG systems work under the 
 
 ## What it does
 
-Takes a mix of PDF and CSV files, chunks and embeds them locally, stores them in a vector database, and lets you ask natural language questions about your data — all powered by a local LLM via Ollama. Includes a custom evaluation framework built from scratch to measure pipeline quality across four metrics.
+Takes a mix of PDF and CSV files, chunks and embeds them locally, stores them in a vector database, and lets you ask natural language questions about your data — all powered by a local LLM via Ollama. Includes a custom evaluation framework, hybrid search (semantic + keyword), and query caching.
 
 ---
 
@@ -19,10 +19,12 @@ Takes a mix of PDF and CSV files, chunks and embeds them locally, stores them in
 | LLM | Ollama (llama3.2) | Free, fully local, no API key needed |
 | Embeddings | Ollama (nomic-embed-text) | Local embedding model, no cost per call |
 | Vector Store | ChromaDB | Simple, persistent, no infrastructure setup |
+| Keyword Search | rank_bm25 (BM25Okapi) | Exact term matching, complements semantic search |
 | PDF Extraction | pypdf | Lightweight, no external dependencies |
 | CSV Handling | pandas | Natural language row conversion |
 | Chunking | tiktoken | Token-based chunking for consistency |
 | Faithfulness Evaluation | cross-encoder/nli-deberta-v3-small | Purpose-built NLI model for entailment scoring |
+| Caching | hashlib + JSON | Deterministic answers for repeated queries |
 
 ---
 
@@ -41,15 +43,21 @@ Documents (PDF + CSV)
         ↓
      User Query
         ↓
-  Query Embedding + Retrieval
+  Semantic Search + BM25 Keyword Search
+        ↓
+  Reciprocal Rank Fusion (RRF) ← hybrid_retrieve()
         ↓
    Context Assembly
         ↓
-   Local LLM (Ollama)     ← rag.py
+   Cache Lookup            ← cache.py
+        ↓ (miss)
+   Local LLM (Ollama)      ← rag.py
+        ↓
+   Cache Write
         ↓
      Final Answer
         ↓
-   Evaluation             ← manual_eval.py
+   Evaluation              ← manual_eval.py
 ```
 
 ---
@@ -60,8 +68,9 @@ Documents (PDF + CSV)
 rag_pipeline/
 ├── ingest.py         # PDF and CSV text extraction
 ├── chunker.py        # Token-based chunking with overlap
-├── vectorstore.py    # Embedding generation and ChromaDB storage/retrieval
-├── rag.py            # Context assembly and LLM response generation
+├── vectorstore.py    # Embeddings, ChromaDB, BM25 keyword search, hybrid RRF retrieval
+├── rag.py            # Context assembly, cache lookup, and LLM response generation
+├── cache.py          # Query + context hashing and JSON-based response caching
 ├── main.py           # Entry point with indexing check and query loop
 ├── manual_eval.py    # Custom evaluation framework with four metrics
 └── data/             # Place your PDF and CSV files here
@@ -87,12 +96,14 @@ git clone <your-repo-url>
 cd rag_pipeline
 python3.11 -m venv venv
 source venv/bin/activate
-pip install chromadb pypdf pandas tiktoken ollama sentence-transformers
+pip install chromadb pypdf pandas tiktoken ollama sentence-transformers rank_bm25
 ```
 
 **Add your data**
 
 Place any `.pdf` or `.csv` files into the `data/` folder.
+
+> **Note:** `query_cache.json` is generated automatically at runtime and is excluded via `.gitignore`, along with `chroma_db/`, `venv/`, and `__pycache__/`.
 
 **Run the pipeline**
 ```bash
@@ -145,7 +156,72 @@ Context Recall:    0.5672  ← low (entity's row not in top-k chunks)
 Faithfulness:      0.8196  ← high ("I don't know" is faithful to context)
 ```
 
-These scores confirmed the pipeline's core weakness — retrieval precision for specific entity lookups — which is the next thing to fix.
+These scores confirmed the pipeline's core weakness — retrieval precision for specific entity lookups — which led directly into the next piece of work.
+
+---
+
+## Hybrid Search (Semantic + Keyword)
+
+Pure semantic search struggles with exact entity lookups. Asking "What did Appolonia Blewitt purchase?" reliably failed to retrieve her data row, because a proper noun like "Appolonia" carries little semantic weight — the embedding captures the general concept of "a purchase question" rather than the specific name.
+
+**The fix — combine two retrieval methods**
+
+- **Semantic search** (existing) — embeddings + cosine similarity via ChromaDB, good at conceptual matching
+- **Keyword search** (new) — BM25 via `rank_bm25`, good at exact term matching
+
+Each method returns its own ranked list of chunks. The two lists are merged using **Reciprocal Rank Fusion (RRF)**:
+
+```
+RRF_score(chunk) = 1 / (semantic_rank + k) + 1 / (keyword_rank + k)
+```
+
+Where `k = 60` is a standard constant that dampens the impact of very low ranks. A chunk missing from one list entirely is assigned a heavy penalty rank rather than being excluded — this preserves the complementary benefit of combining both methods instead of only keeping chunks both methods agree on.
+
+**Why BM25 needed preprocessing to work**
+
+The first implementation of keyword search scored the target chunk **0.0** — completely failing to surface it. The cause: the BM25 corpus was left untokenized and unfiltered (raw `.split(" ")`) while the query was preprocessed, so query and corpus tokens never matched on format. Lowercasing, stripping punctuation, and removing stop words from both the query *and* the corpus fixed this — the target chunk's BM25 score went from 0.0 to the highest score in the entire corpus.
+
+**Result**
+
+Before hybrid search, "What did Appolonia Blewitt purchase?" returned a hallucinated, incorrect answer regardless of retrieval attempts. After hybrid search, the correct chunk is retrieved consistently and the LLM, given the right context, produces the correct answer: *"Appolonia Blewitt purchased a product in the category of Clothing - Outerwear and paid $215.38."*
+
+---
+
+## LLM Non-Determinism
+
+Even with the correct context retrieved consistently (verified by hashing the assembled context string across repeated calls), the LLM's answer to the identical question varied from call to call — sometimes correct, sometimes a hallucinated wrong answer, sometimes a false "no data available."
+
+**Diagnosis process**
+
+1. Confirmed retrieval was fully deterministic — identical context hash across repeated calls
+2. Set `temperature: 0` in the Ollama call — reduced but did not eliminate variation
+3. Added a fixed `seed` alongside temperature — still did not fully eliminate variation
+
+**Root cause**
+
+With identical input, identical temperature, and identical seed, output still varied. This points to floating point non-determinism in GPU-accelerated inference (Apple Metal backend on macOS) — parallel computation can execute operations in different orders across runs, and when two candidate tokens have very close probabilities, tiny numerical differences can flip which one is selected. Once one token differs early in generation, the rest of the response can diverge completely.
+
+This is a known limitation of local LLM inference on consumer GPU hardware, not a configuration error. CPU-only inference is more reliably deterministic but significantly slower.
+
+---
+
+## Query Caching
+
+Rather than fight GPU non-determinism directly, a query + context cache was added to guarantee consistent answers for repeated questions and avoid redundant LLM calls.
+
+**Design**
+
+- **Cache key** — SHA-256 hash of `query + context` combined, not query alone. This means the cache naturally invalidates itself whenever retrieval returns different context (e.g. after re-indexing new data), without needing explicit invalidation logic.
+- **Cache value** — the original query, the answer, and a timestamp, stored as JSON for human-readable inspection.
+- **Storage** — a flat `query_cache.json` file, checked before every LLM call and written to after every cache miss.
+
+**A subtle bug along the way**
+
+The cache initially appeared not to work — every call printed "No cache exists!" even on the second identical question. The cause was using `os.listdir()` to check file existence relative to whatever directory the script happened to be run from, which is unreliable. Switching to `os.path.exists(file_name)` — which checks the exact given path directly — fixed it immediately.
+
+**What caching does and doesn't solve**
+
+Caching guarantees the *same* answer for a *repeated* identical query + context pair. It does not fix the underlying non-determinism — a genuinely new question will still be subject to the same GPU floating point variability described above. This is an explicit tradeoff: consistency for repeated queries, not a fix for the root cause.
 
 ---
 
@@ -191,19 +267,21 @@ Building answer relevancy with embeddings revealed a critical flaw — a respons
 
 ## Known Limitations
 
-- **Exact lookup queries** — semantic search struggles with name or ID based lookups. Hybrid search combining semantic and keyword retrieval is the next planned improvement.
 - **Aggregation queries** — RAG is not designed for calculations over full datasets. A pandas agent extension is planned to handle this.
-- **Small model reasoning** — llama3.2 at 2GB occasionally hallucinates despite prompt constraints. Swapping to mistral or gemma3 improves reasoning quality at the cost of speed.
+- **Small model reasoning** — llama3.2 at 2GB occasionally hallucinates despite prompt constraints and a tightened system prompt. Swapping to mistral or gemma3 improves reasoning quality at the cost of speed.
 - **Answer relevancy metric** — embedding-based relevancy rewards non-answers that mirror the question. LLM as judge would be more reliable for this specific metric.
+- **LLM non-determinism on GPU** — even with temperature 0 and a fixed seed, identical query + context can occasionally produce different answers due to floating point non-determinism in GPU-accelerated inference. Mitigated for repeated queries via caching, not fully solved for novel queries.
+- **BM25 index rebuilt per call** — `keyword_retrieve` currently rebuilds the BM25 index from the full corpus on every call rather than building it once at indexing time. Fine at this dataset's scale (370 chunks), would not scale to large corpora.
 
 ---
 
 ## Planned Extensions
 
-- [ ] Hybrid search combining semantic and keyword retrieval
 - [ ] Pandas agent for structured data aggregations
 - [ ] Query transformation before retrieval
 - [ ] LLM as judge for answer relevancy metric
+- [ ] Build BM25 index once at indexing time instead of per-query
+- [ ] Re-run evaluation metrics with hybrid retrieval for a quantified before/after comparison
 - [ ] Support for additional file types (`.txt`, `.docx`)
 - [ ] Swap local LLM for Claude API with minimal code changes
 
@@ -216,10 +294,12 @@ Each branch represents a milestone in the learning journey:
 | Branch | What it contains |
 |---|---|
 | `v1-rag-pipeline-core` | Core RAG pipeline — ingestion, chunking, vector store, retrieval, generation |
-| `main` | Core pipeline + custom evaluation framework |
+| `v2-rag-pipeline-eval` | Core pipeline + custom evaluation framework (4 metrics, NLI faithfulness) |
+| `v3-hybrid-search-caching` | Hybrid search (BM25 + RRF), LLM non-determinism diagnosis, query caching |
+| `main` | Latest — all of the above |
 
 ---
 
 ## Why this project
 
-I watched a team demo a RAG-based agent built on Databricks and realised I didn't fully understand every layer of what they had built. Rather than accepting a surface level understanding, I built the entire pipeline from scratch to understand each component — ingestion, chunking, embedding, retrieval, generation, and now evaluation — independently before using any framework to abstract it away.
+I watched a team demo a RAG-based agent built on Databricks and realised I didn't fully understand every layer of what they had built. Rather than accepting a surface level understanding, I built the entire pipeline from scratch to understand each component — ingestion, chunking, embedding, retrieval, generation, evaluation, hybrid search, and caching — independently before using any framework to abstract it away. Several of the most useful lessons came from debugging — a BM25 corpus that wasn't tokenized the same way as the query, a cache that silently failed because of `os.listdir()` vs `os.path.exists()`, and a deep dive into why a local LLM doesn't always return the same output even at temperature 0.
