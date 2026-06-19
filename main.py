@@ -3,7 +3,7 @@ from rag import get_llm_output
 import chromadb
 from ingest import read_data
 from chunker import get_chunks
-from vectorstore import index_chunks, retrieve
+from vectorstore import index_chunks, retrieve, get_context
 
 if __name__ == "__main__":
     client = chromadb.PersistentClient(path="./chroma_db")
@@ -19,10 +19,17 @@ if __name__ == "__main__":
         query = input("\nAsk a question (or 'quit'): ")
         if query.lower() == "quit":
             break
-        results = retrieve(query, top_k=10)
-        # print("RETRIEVED CONTEXT:")
-        context = "\n\n".join(results["documents"][0])
+        # results = retrieve(query, top_k=10)
+        # # print("RETRIEVED CONTEXT:")
+        # context = get_context(query, k= 5)
+        # context = "\n\n".join(context)
+        
         # print(context)
-        answer = get_llm_output(query, context)
+        # answer = get_llm_output(query, context)
         print("#"*100)
+        # print(answer)
+        context = get_context(query, k=5)
+        context_str = "\n\n".join(context)
+        # print("CONTEXT HASH:", hash(context_str))
+        answer = get_llm_output(query, context_str)
         print(answer)
