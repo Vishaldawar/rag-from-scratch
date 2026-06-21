@@ -8,7 +8,7 @@ Built as a learning project to deeply understand how RAG systems work under the 
 
 ## What it does
 
-Takes a mix of PDF and CSV files, chunks and embeds them locally, stores them in a vector database, and lets you ask natural language questions about your data — all powered by a local LLM via Ollama. Includes a custom evaluation framework, hybrid search (semantic + keyword), and query caching.
+Takes a mix of PDF and CSV files, chunks and embeds them locally, stores them in a vector database, and lets you ask natural language questions about your data — all powered by a local LLM via Ollama. Includes a custom evaluation framework, hybrid search with cross-encoder reranking, query caching, a pandas agent for aggregation queries, and an LLM-based router that picks the right path automatically.
 
 ---
 
@@ -26,6 +26,8 @@ Takes a mix of PDF and CSV files, chunks and embeds them locally, stores them in
 | Faithfulness Evaluation | cross-encoder/nli-deberta-v3-small | Purpose-built NLI model for entailment scoring |
 | Reranking | cross-encoder/ms-marco-MiniLM-L-6-v2 | Query-aware relevance scoring on top of hybrid retrieval |
 | Caching | hashlib + JSON | Deterministic answers for repeated queries |
+| Aggregation | pandas + LLM-generated code via `exec()` | True full-dataset calculations RAG can't do |
+| Routing | Ollama (llama3.2) as classifier | Decides lookup (RAG) vs aggregation (pandas agent) per query |
 
 ---
 
@@ -44,23 +46,35 @@ Documents (PDF + CSV)
         ↓
      User Query
         ↓
-  Semantic Search + BM25 Keyword Search
+  Query Classification    ← router.py  ("lookup" or "aggregation")
         ↓
-  Reciprocal Rank Fusion (RRF) ← hybrid_retrieve()  → top 20 candidates
-        ↓
-  Cross-Encoder Reranking ← rerank()  → top 5 final
-        ↓
-   Context Assembly
-        ↓
-   Cache Lookup            ← cache.py
-        ↓ (miss)
-   Local LLM (Ollama)      ← rag.py
-        ↓
-   Cache Write
-        ↓
-     Final Answer
-        ↓
-   Evaluation              ← manual_eval.py
+        ├── lookup ──────────────────────────────┐
+        │                                         ↓
+        │                          Semantic Search + BM25 Keyword Search
+        │                                         ↓
+        │                          Reciprocal Rank Fusion (RRF) ← hybrid_retrieve() → top 20
+        │                                         ↓
+        │                          Cross-Encoder Reranking ← rerank() → top 5
+        │                                         ↓
+        │                                  Context Assembly
+        │                                         ↓
+        │                                  Cache Lookup    ← cache.py
+        │                                         ↓ (miss)
+        │                                  Local LLM (Ollama) ← rag.py
+        │                                         ↓
+        │                                  Cache Write
+        │                                         ↓
+        │                          Answer + Source (retrieved chunks)
+        │
+        └── aggregation ─────────────────────────┐
+                                                   ↓
+                                    Schema + Sample Rows → LLM ← pandas_agent.py
+                                                   ↓
+                                    Generated pandas code
+                                                   ↓
+                                    exec() against full dataframe
+                                                   ↓
+                                    Answer + Source (generated code)
 ```
 
 ---
@@ -69,14 +83,16 @@ Documents (PDF + CSV)
 
 ```
 rag_pipeline/
-├── ingest.py         # PDF and CSV text extraction
-├── chunker.py        # Token-based chunking with overlap
-├── vectorstore.py    # Embeddings, ChromaDB, BM25 keyword search, hybrid RRF retrieval, cross-encoder reranking
-├── rag.py            # Context assembly, cache lookup, and LLM response generation
-├── cache.py          # Query + context hashing and JSON-based response caching
-├── main.py           # Entry point with indexing check and query loop
-├── manual_eval.py    # Custom evaluation framework with four metrics
-└── data/             # Place your PDF and CSV files here
+├── ingest.py          # PDF and CSV text extraction
+├── chunker.py         # Token-based chunking with overlap
+├── vectorstore.py     # Embeddings, ChromaDB, BM25 keyword search, hybrid RRF retrieval, cross-encoder reranking
+├── rag.py             # Context assembly, cache lookup, and LLM response generation
+├── cache.py           # Query + context hashing and JSON-based response caching
+├── pandas_agent.py    # LLM-generated pandas code for aggregation queries, executed via exec()
+├── router.py          # LLM-based query classifier — routes to RAG or pandas agent
+├── main.py            # Entry point with indexing check, routing, and query loop
+├── manual_eval.py     # Custom evaluation framework with four metrics
+└── data/              # Place your PDF and CSV files here
 ```
 
 ---
@@ -217,6 +233,62 @@ The first implementation attempted to use `[query, chunk]` pairs as Python dicti
 
 ---
 
+## Pandas Agent (Aggregation Queries)
+
+RAG fundamentally cannot answer aggregation questions correctly — "what is the average transaction amount for Food" requires seeing every matching row, but RAG only ever retrieves a sample of chunks. Increasing `top_k` doesn't fix this; it was tried early on (`top_k=400`) and instead caused the LLM to lose focus entirely and produce a generic, ungrounded summary instead of an answer.
+
+**The fix — let the LLM write code instead of reason over text**
+
+Rather than retrieving chunks, the pandas agent gives the LLM:
+- The dataframe's schema (column names and types)
+- A handful of sample rows for context
+- The question
+
+…and asks it to generate **pandas code** that computes the answer, which is then executed against the **full** dataframe with `exec()`. The LLM never sees the whole dataset — it only ever needs to understand the shape of the data well enough to write correct code. Pandas does the actual computation, not the LLM, so the result is mathematically exact rather than reasoned-and-possibly-wrong.
+
+```
+Question + schema + sample rows → LLM
+        ↓
+Generated pandas code (stored in a 'result' variable)
+        ↓
+exec(code, {}, {"df": full_dataframe, "pd": pd})
+        ↓
+result extracted from the exec() namespace
+```
+
+**Design choice — a class, not a function**
+
+The agent is implemented as a class (`pandas_agent_class`) rather than a plain function specifically so that intermediate state — the generated code, the full dataframe, the final result — stays accessible as object attributes after the call (`self.code`, `self.result`). This made debugging significantly easier than earlier function-based attempts, where returning the code *or* the result meant choosing one and losing visibility into the other.
+
+**A bug worth noting**
+
+An early version computed the schema and sample rows but never actually inserted them into the prompt sent to the LLM — the variables existed but weren't referenced in the f-string. The code ran without error, but the LLM was effectively working blind, with no idea what columns existed. A reminder that "the code runs" and "the code does what you intended" are different things worth checking separately.
+
+**Safety note**
+
+This executes LLM-generated code directly via `exec()` with access to the real dataframe. This is acceptable for local, single-user experimentation but would need sandboxing (e.g. a restricted execution environment, an allowlist of permitted operations) before being exposed to untrusted input in any shared or production setting.
+
+---
+
+## Query Router
+
+With both a RAG path and a pandas agent path now available, the pipeline needs to decide which one to use for a given question. A keyword-based approach (checking for words like "average" or "total") was considered but rejected as too brittle — many aggregation questions don't contain obvious trigger words, and many lookup questions do.
+
+**The fix — classify with the LLM itself**
+
+A lightweight classification call asks the LLM to label the query as either `"lookup"` or `"aggregation"` before any retrieval happens, based on intent rather than keyword matching. The query is then routed to the RAG pipeline or the pandas agent accordingly. An unrecognised classification result defaults to the RAG path, since it's the safer fallback for ambiguous queries.
+
+**Source attribution**
+
+Rather than relying on the LLM to introspect on its own process when asked something like "what is your source" — which it's unreliable at and could hallucinate about — the pipeline deterministically prints the actual source alongside every answer:
+
+- **RAG path** — the retrieved (and reranked) chunks used as context
+- **Pandas agent path** — the generated pandas code that computed the answer
+
+This sidesteps needing the LLM to explain itself after the fact; the source is shown automatically because the pipeline already has it as state from generating the answer.
+
+---
+
 ## LLM Non-Determinism
 
 Even with the correct context retrieved consistently (verified by hashing the assembled context string across repeated calls), the LLM's answer to the identical question varied from call to call — sometimes correct, sometimes a hallucinated wrong answer, sometimes a false "no data available."
@@ -297,24 +369,28 @@ Building answer relevancy with embeddings revealed a critical flaw — a respons
 
 ## Known Limitations
 
-- **Aggregation queries** — RAG is not designed for calculations over full datasets. A pandas agent extension is planned to handle this.
 - **Small model reasoning** — llama3.2 at 2GB occasionally hallucinates despite prompt constraints and a tightened system prompt. Swapping to mistral or gemma3 improves reasoning quality at the cost of speed.
 - **Answer relevancy metric** — embedding-based relevancy rewards non-answers that mirror the question. LLM as judge would be more reliable for this specific metric.
 - **LLM non-determinism on GPU** — even with temperature 0 and a fixed seed, identical query + context can occasionally produce different answers due to floating point non-determinism in GPU-accelerated inference. Mitigated for repeated queries via caching, not fully solved for novel queries.
 - **BM25 index rebuilt per call** — `keyword_retrieve` currently rebuilds the BM25 index from the full corpus on every call rather than building it once at indexing time. Fine at this dataset's scale (370 chunks), would not scale to large corpora.
-- **Reranking adds latency** — every query now pays the cost of a cross-encoder forward pass over ~20 candidates, on top of embedding + BM25 retrieval. Not yet measured precisely, but noticeably slower than hybrid search alone.
+- **Reranking adds latency** — every RAG-path query pays the cost of a cross-encoder forward pass over ~20 candidates, on top of embedding + BM25 retrieval. Not yet measured precisely, but noticeably slower than hybrid search alone.
 - **Reranker model is general-purpose** — `ms-marco-MiniLM-L-6-v2` was trained on web search query-passage pairs, not transaction-style tabular text. It works well here but hasn't been validated against alternatives for this specific data shape.
+- **`exec()` on LLM-generated code is unsandboxed** — the pandas agent executes generated code with full access to the dataframe and pandas itself. Fine for local single-user use, not safe for untrusted or multi-user input without a restricted execution environment.
+- **Router has no evaluation of its own** — query classification accuracy (lookup vs aggregation) hasn't been measured against a labelled test set; correctness is currently judged by spot-checking.
+- **Pandas agent has no protection against malformed code** — if the LLM generates code that doesn't define a `result` variable, or that errors out, there's currently no graceful fallback or retry.
 
 ---
 
 ## Planned Extensions
 
-- [ ] Pandas agent for structured data aggregations
 - [ ] Query transformation before retrieval (HyDE)
 - [ ] LLM as judge for answer relevancy metric
 - [ ] Build BM25 index once at indexing time instead of per-query
 - [ ] Re-run evaluation metrics with hybrid retrieval + reranking for a quantified before/after comparison
 - [ ] Benchmark reranker latency and evaluate alternative cross-encoder checkpoints
+- [ ] Labelled test set to measure router classification accuracy
+- [ ] Graceful fallback/retry when pandas agent generates malformed code
+- [ ] Sandboxed execution environment for the pandas agent
 - [ ] Support for additional file types (`.txt`, `.docx`)
 - [ ] Swap local LLM for Claude API with minimal code changes
 
@@ -330,10 +406,13 @@ Each branch represents a milestone in the learning journey:
 | `v2-rag-pipeline-eval` | Core pipeline + custom evaluation framework (4 metrics, NLI faithfulness) |
 | `v3-hybrid-search-caching` | Hybrid search (BM25 + RRF), LLM non-determinism diagnosis, query caching |
 | `v4-reranking` | Cross-encoder reranking on top of hybrid search (widened candidate pool, two-stage retrieval) |
+| `v5-pandas-agent-router` | Pandas agent for aggregation queries, LLM-based router, source attribution |
 | `main` | Latest — all of the above |
 
 ---
 
 ## Why this project
 
-I watched a team demo a RAG-based agent built on Databricks and realised I didn't fully understand every layer of what they had built. Rather than accepting a surface level understanding, I built the entire pipeline from scratch to understand each component — ingestion, chunking, embedding, retrieval, generation, evaluation, hybrid search, reranking, and caching — independently before using any framework to abstract it away. Several of the most useful lessons came from debugging — a BM25 corpus that wasn't tokenized the same way as the query, a cache that silently failed because of `os.listdir()` vs `os.path.exists()`, a deep dive into why a local LLM doesn't always return the same output even at temperature 0, and a reminder that Python lists aren't hashable when reranking scores needed a dictionary key.
+I watched a team demo a RAG-based agent built on Databricks and realised I didn't fully understand every layer of what they had built. Rather than accepting a surface level understanding, I built the entire pipeline from scratch to understand each component — ingestion, chunking, embedding, retrieval, generation, evaluation, hybrid search, reranking, caching, aggregation via a pandas agent, and query routing — independently before using any framework to abstract it away. Several of the most useful lessons came from debugging — a BM25 corpus that wasn't tokenized the same way as the query, a cache that silently failed because of `os.listdir()` vs `os.path.exists()`, a deep dive into why a local LLM doesn't always return the same output even at temperature 0, a reminder that Python lists aren't hashable when reranking scores needed a dictionary key, and a prompt that computed the right variables but forgot to actually use them.
+
+This project also marks closing the original gap that started it — the team's RAG agent now has a fully understood, working, locally-built counterpart, with a documented account of where it's stronger, where it's weaker, and why.
