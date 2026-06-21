@@ -54,7 +54,10 @@ if __name__ == "__main__":
         if category == "aggregation":
             pandas_agent_obj = pandas_agent_class(csv_path="./data/mock_data.csv")
             answer = pandas_agent_obj.pandas_agent(query)
-            print(f"\nAnswer: {answer}")
+            try:
+                print(f"\nAnswer: {answer}")
+            except:
+                print("Could not get an answer from the LLM!")
             print(f"\n[Source — generated code]:\n{pandas_agent_obj.code}")
         else:
             context = get_context(query, k=5)
