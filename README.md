@@ -24,6 +24,7 @@ Takes a mix of PDF and CSV files, chunks and embeds them locally, stores them in
 | CSV Handling | pandas | Natural language row conversion |
 | Chunking | tiktoken | Token-based chunking for consistency |
 | Faithfulness Evaluation | cross-encoder/nli-deberta-v3-small | Purpose-built NLI model for entailment scoring |
+| Reranking | cross-encoder/ms-marco-MiniLM-L-6-v2 | Query-aware relevance scoring on top of hybrid retrieval |
 | Caching | hashlib + JSON | Deterministic answers for repeated queries |
 
 ---
@@ -45,7 +46,9 @@ Documents (PDF + CSV)
         ↓
   Semantic Search + BM25 Keyword Search
         ↓
-  Reciprocal Rank Fusion (RRF) ← hybrid_retrieve()
+  Reciprocal Rank Fusion (RRF) ← hybrid_retrieve()  → top 20 candidates
+        ↓
+  Cross-Encoder Reranking ← rerank()  → top 5 final
         ↓
    Context Assembly
         ↓
@@ -68,7 +71,7 @@ Documents (PDF + CSV)
 rag_pipeline/
 ├── ingest.py         # PDF and CSV text extraction
 ├── chunker.py        # Token-based chunking with overlap
-├── vectorstore.py    # Embeddings, ChromaDB, BM25 keyword search, hybrid RRF retrieval
+├── vectorstore.py    # Embeddings, ChromaDB, BM25 keyword search, hybrid RRF retrieval, cross-encoder reranking
 ├── rag.py            # Context assembly, cache lookup, and LLM response generation
 ├── cache.py          # Query + context hashing and JSON-based response caching
 ├── main.py           # Entry point with indexing check and query loop
@@ -187,6 +190,33 @@ Before hybrid search, "What did Appolonia Blewitt purchase?" returned a hallucin
 
 ---
 
+## Cross-Encoder Reranking
+
+Hybrid search fixed *recall* — the right chunk now reliably appears somewhere in the retrieved set. But it didn't always rank at the top. RRF combines two rank-based signals, and the correct chunk for Appolonia, for example, landed 2nd rather than 1st — good enough most of the time, but not a guarantee, especially as the candidate pool grows.
+
+**Why embeddings and BM25 alone aren't enough for precise ranking**
+
+Both semantic search and BM25 score a query against each chunk *independently* — the chunk's representation (its embedding, or its token statistics) is computed once, without ever being processed alongside the specific query. This means two superficially similar chunks (e.g. two different customers who both bought "Clothing - Outerwear") can score nearly identically, even though only one is the actual answer.
+
+A cross-encoder processes the query and a candidate chunk *together*, in a single forward pass, letting the model directly attend to how specific words in the query relate to specific words in the chunk. This is far more precise — but also far more expensive, since there's no precomputation possible; every query-chunk pair requires a fresh model call.
+
+**The two-stage retrieval pattern this implies**
+
+1. **Stage 1 — Hybrid retrieval (cheap, approximate)** — widened from top 5 to top 20 candidates, using existing semantic + BM25 + RRF
+2. **Stage 2 — Reranking (expensive, precise)** — `cross-encoder/ms-marco-MiniLM-L-6-v2` scores all 20 query-chunk pairs in a single batched call, chunks are sorted by this score, and only the top 5 are kept for the LLM
+
+This mirrors the same `CrossEncoder` pattern already used for faithfulness scoring in the evaluation framework — same library, same `.predict()` call shape — just a different pretrained checkpoint (trained for query-passage relevance rather than NLI) and a direct sort instead of a softmax over three classes.
+
+**Result**
+
+With reranking added, Appolonia's chunk moved from rank 2 (post-RRF) to rank 1 (post-rerank) — and across testing, unique entity-lookup queries are now answered correctly far more consistently than with hybrid search alone.
+
+**A bug worth noting**
+
+The first implementation attempted to use `[query, chunk]` pairs as Python dictionary keys to track scores. Lists aren't hashable in Python, so this fails — the fix was to key the score dictionary by the chunk text itself (a string, which is hashable) rather than the pair.
+
+---
+
 ## LLM Non-Determinism
 
 Even with the correct context retrieved consistently (verified by hashing the assembled context string across repeated calls), the LLM's answer to the identical question varied from call to call — sometimes correct, sometimes a hallucinated wrong answer, sometimes a false "no data available."
@@ -272,16 +302,19 @@ Building answer relevancy with embeddings revealed a critical flaw — a respons
 - **Answer relevancy metric** — embedding-based relevancy rewards non-answers that mirror the question. LLM as judge would be more reliable for this specific metric.
 - **LLM non-determinism on GPU** — even with temperature 0 and a fixed seed, identical query + context can occasionally produce different answers due to floating point non-determinism in GPU-accelerated inference. Mitigated for repeated queries via caching, not fully solved for novel queries.
 - **BM25 index rebuilt per call** — `keyword_retrieve` currently rebuilds the BM25 index from the full corpus on every call rather than building it once at indexing time. Fine at this dataset's scale (370 chunks), would not scale to large corpora.
+- **Reranking adds latency** — every query now pays the cost of a cross-encoder forward pass over ~20 candidates, on top of embedding + BM25 retrieval. Not yet measured precisely, but noticeably slower than hybrid search alone.
+- **Reranker model is general-purpose** — `ms-marco-MiniLM-L-6-v2` was trained on web search query-passage pairs, not transaction-style tabular text. It works well here but hasn't been validated against alternatives for this specific data shape.
 
 ---
 
 ## Planned Extensions
 
 - [ ] Pandas agent for structured data aggregations
-- [ ] Query transformation before retrieval
+- [ ] Query transformation before retrieval (HyDE)
 - [ ] LLM as judge for answer relevancy metric
 - [ ] Build BM25 index once at indexing time instead of per-query
-- [ ] Re-run evaluation metrics with hybrid retrieval for a quantified before/after comparison
+- [ ] Re-run evaluation metrics with hybrid retrieval + reranking for a quantified before/after comparison
+- [ ] Benchmark reranker latency and evaluate alternative cross-encoder checkpoints
 - [ ] Support for additional file types (`.txt`, `.docx`)
 - [ ] Swap local LLM for Claude API with minimal code changes
 
@@ -296,10 +329,11 @@ Each branch represents a milestone in the learning journey:
 | `v1-rag-pipeline-core` | Core RAG pipeline — ingestion, chunking, vector store, retrieval, generation |
 | `v2-rag-pipeline-eval` | Core pipeline + custom evaluation framework (4 metrics, NLI faithfulness) |
 | `v3-hybrid-search-caching` | Hybrid search (BM25 + RRF), LLM non-determinism diagnosis, query caching |
+| `v4-reranking` | Cross-encoder reranking on top of hybrid search (widened candidate pool, two-stage retrieval) |
 | `main` | Latest — all of the above |
 
 ---
 
 ## Why this project
 
-I watched a team demo a RAG-based agent built on Databricks and realised I didn't fully understand every layer of what they had built. Rather than accepting a surface level understanding, I built the entire pipeline from scratch to understand each component — ingestion, chunking, embedding, retrieval, generation, evaluation, hybrid search, and caching — independently before using any framework to abstract it away. Several of the most useful lessons came from debugging — a BM25 corpus that wasn't tokenized the same way as the query, a cache that silently failed because of `os.listdir()` vs `os.path.exists()`, and a deep dive into why a local LLM doesn't always return the same output even at temperature 0.
+I watched a team demo a RAG-based agent built on Databricks and realised I didn't fully understand every layer of what they had built. Rather than accepting a surface level understanding, I built the entire pipeline from scratch to understand each component — ingestion, chunking, embedding, retrieval, generation, evaluation, hybrid search, reranking, and caching — independently before using any framework to abstract it away. Several of the most useful lessons came from debugging — a BM25 corpus that wasn't tokenized the same way as the query, a cache that silently failed because of `os.listdir()` vs `os.path.exists()`, a deep dive into why a local LLM doesn't always return the same output even at temperature 0, and a reminder that Python lists aren't hashable when reranking scores needed a dictionary key.
