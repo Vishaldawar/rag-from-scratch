@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import ollama
-from vectorstore import retrieve
+from vectorstore import retrieve, rerank, keyword_retrieve, hybrid_retrieve
 from sentence_transformers import CrossEncoder
 from vectorstore import get_context
 from rag import get_llm_output
@@ -53,17 +53,24 @@ def faithfullness(nli_model_obj, answer: str, context_chunks: list[str]) -> floa
 if __name__ == "__main__":
     files = os.listdir("./data")
     files = [x for x in files if '.ipynb' not in x]
+    k = 20
+    top_k = 5
     all_text = read_data(files)
     chunks = get_chunks(all_text)
     question = "What product category did Appolonia Blewitt purchase and how much did she pay?"
-    ground_truth = "Appolonia Blewitt bought a garment from outerwear clothing category for $215.38."
+    ground_truth = "Appolonia Blewitt purchased Clothing - Outerwear for $215.38."
     # answer = "I do not have enough data to answer the question fully about what product category Appolonia Blewitt purchased and how much she paid."
-    context = get_context(question, k=5)
+    context = get_context(question, k=5, top_k = top_k)
     context = "\n\n".join(context)
     answer = get_llm_output(question, context)
     relevancy = answer_relevancy(question, answer)
-    results = retrieve(question, top_k=5)
-    chunks = results["documents"][0]
+    result = retrieve(question, top_k=k)
+    chunks_text = [x['text'] for x in chunks]
+    keyword_result = keyword_retrieve(chunks_text, query = question, k=k)
+    hybrid_chunks = hybrid_retrieve(result['documents'][0], keyword_result, top_k = k)
+    reranked_context = rerank(question, hybrid_chunks, top_k = top_k)
+    chunks = reranked_context
+    # chunks = results["documents"][0]
     print(f"For question : \n{question} \nand answer : \n{answer} : \nthe relevancy score is : {relevancy}")
     precision = context_precision(question, chunks)
     print(f"For question : \n{question} \nand answer : \n{answer} : \nthe context precision score is : {precision}")

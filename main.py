@@ -4,6 +4,8 @@ import chromadb
 from ingest import read_data
 from chunker import get_chunks
 from vectorstore import index_chunks, retrieve, get_context
+import warnings
+warnings.filterwarnings('ignore')
 
 if __name__ == "__main__":
     client = chromadb.PersistentClient(path="./chroma_db")
@@ -28,7 +30,7 @@ if __name__ == "__main__":
         # answer = get_llm_output(query, context)
         print("#"*100)
         # print(answer)
-        context = get_context(query, k=5)
+        context = get_context(query, k=20, top_k=5)
         context_str = "\n\n".join(context)
         # print("CONTEXT HASH:", hash(context_str))
         answer = get_llm_output(query, context_str)

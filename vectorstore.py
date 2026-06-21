@@ -5,6 +5,8 @@ from ingest import read_data
 from chunker import get_chunks
 from rank_bm25 import BM25Okapi
 import re
+from sentence_transformers import CrossEncoder
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 client = chromadb.PersistentClient(path="./chroma_db")
 collection = client.get_or_create_collection("rag_collection")
@@ -71,7 +73,19 @@ def hybrid_retrieve(semantic_chunks:list, keyword_chunks:list, top_k: int):
     sorted_rrf = [x for x in sorted_rrf.keys()][:top_k]
     return sorted_rrf
 
-def get_context(query, k):
+
+def rerank(query: str, chunks: list[str], top_k: int = 5) -> list[str]:
+    all_pairs = [[query, chunk] for chunk in chunks]
+    reranked_scores = reranker.predict(all_pairs)
+    
+    all_scores = {chunk: score for chunk, score in zip(chunks, reranked_scores)}
+    all_scores = dict(sorted(all_scores.items(), key=lambda item: item[1], reverse=True))
+    reranked_context = list(all_scores.keys())[:top_k]
+    return reranked_context
+
+
+
+def get_context(query, k, top_k):
     files = os.listdir("./data")
     files = [x for x in files if '.ipynb' not in x]
     all_text = read_data(files)
@@ -81,18 +95,21 @@ def get_context(query, k):
     result = retrieve(query, top_k=k)
     chunks_text = [x['text'] for x in chunks]
     keyword_result = keyword_retrieve(chunks_text, query = query, k=k)
-    hybrid_chunks = hybrid_retrieve(result['documents'][0], keyword_result, top_k = 5)
-    return hybrid_chunks
+    hybrid_chunks = hybrid_retrieve(result['documents'][0], keyword_result, top_k = k)
+    reranked_context = rerank(query, hybrid_chunks, top_k = top_k)
+    return reranked_context
+
 
 
 if __name__ == "__main__":
 
-    k = 5
+    k = 20
     query = "What product category did Appolonia Blewitt purchase and how much did she pay?"
     # result = retrieve(query, top_k=k)
     print("#"*100)
-    context = get_context(query, k)
+    context = get_context(query, k=k, top_k = 5)
     print(context)
+    # rerank(query, chunks=context)
     # print(result)
     # print("#"*100)
     # print(result['documents'][0])
